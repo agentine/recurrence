@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
+import calendar
 import datetime
 import functools
+import inspect
+import logging
 import random
 import re
+import threading
 import time as _time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Hashable, List, Optional, Protocol, Set, Union
 
 from recurrence import CancelJob
 from recurrence.exceptions import IntervalError, ScheduleValueError
+
+_logger = logging.getLogger("recurrence")
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +46,12 @@ class _DefaultClock:
 class Job:
     """A periodically-scheduled job, built via a fluent API."""
 
-    def __init__(self, interval: int = 1, scheduler: Optional[Scheduler] = None) -> None:
+    def __init__(
+        self,
+        interval: int = 1,
+        scheduler: Optional[Scheduler] = None,
+        on_error: Optional[Callable[[Job, Exception], None]] = None,
+    ) -> None:
         self.interval: int = interval
         self.latest: Optional[int] = None
         self.job_func: Optional[functools.partial[Any]] = None
@@ -52,6 +65,8 @@ class Job:
         self.cancel_after: Optional[datetime.datetime] = None
         self.tags: Set[Hashable] = set()
         self.scheduler: Optional[Scheduler] = scheduler
+        self.on_error: Optional[Callable[[Job, Exception], None]] = on_error
+        self._is_async: bool = False
 
     def __repr__(self) -> str:
         if self.job_func:
@@ -126,6 +141,12 @@ class Job:
             raise IntervalError("Use .weeks instead of .week when interval > 1")
         return self.weeks
 
+    @property
+    def month(self) -> Job:
+        if self.interval != 1:
+            raise IntervalError("Use .months instead of .month when interval > 1")
+        return self.months
+
     # -----------------------------------------------------------------------
     # Time-unit properties (plural)
     # -----------------------------------------------------------------------
@@ -153,6 +174,11 @@ class Job:
     @property
     def weeks(self) -> Job:
         self.unit = "weeks"
+        return self
+
+    @property
+    def months(self) -> Job:
+        self.unit = "months"
         return self
 
     # -----------------------------------------------------------------------
@@ -223,23 +249,19 @@ class Job:
         """Schedule the job at a specific time.
 
         Format depends on unit:
-        - day/weekday: ``"HH:MM"`` or ``"HH:MM:SS"``
+        - day/weekday/month: ``"HH:MM"`` or ``"HH:MM:SS"``
         - hour: ``":MM"`` or ``"MM:SS"``
         - minute: ``":SS"``
-        - second: ``":SS"`` (ignored — seconds unit has no sub-second at())
         """
-        # Validate that the unit is set.
-        if self.unit not in ("hours", "days", "weeks", "minutes", "seconds"):
+        if self.unit not in ("hours", "days", "weeks", "minutes", "seconds", "months"):
             raise ScheduleValueError(
-                "at() is only valid for second/minute/hour/day/week units"
+                "at() is only valid for minute/hour/day/week/month units"
             )
 
         if tz is not None:
             self.at_time_zone = _resolve_tz(tz)
 
-        # Parse time_str based on unit.
-        if self.unit in ("days", "weeks"):
-            # HH:MM or HH:MM:SS
+        if self.unit in ("days", "weeks", "months"):
             m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", time_str)
             if not m:
                 raise ScheduleValueError(
@@ -254,7 +276,6 @@ class Job:
                 )
             self.at_time = datetime.time(hour, minute, second)
         elif self.unit == "hours":
-            # :MM or MM:SS
             if time_str.startswith(":"):
                 m = re.match(r"^:(\d{2})$", time_str)
                 if not m:
@@ -282,7 +303,6 @@ class Job:
                     )
                 self.at_time = datetime.time(0, minute, second)
         elif self.unit == "minutes":
-            # :SS
             m = re.match(r"^:(\d{2})$", time_str)
             if not m:
                 raise ScheduleValueError(
@@ -296,8 +316,6 @@ class Job:
                 )
             self.at_time = datetime.time(0, 0, second)
         elif self.unit == "seconds":
-            # For seconds unit, at() is a no-op (no sub-second precision).
-            # Accept :SS format for API completeness but effectively ignored.
             raise ScheduleValueError(
                 "at() is not meaningful for the seconds unit"
             )
@@ -326,7 +344,6 @@ class Job:
             if self.cancel_after < now:
                 self.cancel_after += datetime.timedelta(days=1)
         elif isinstance(until_time, str):
-            # Parse "HH:MM" or "HH:MM:SS" or "YYYY-MM-DD HH:MM:SS"
             if " " in until_time and "-" in until_time:
                 self.cancel_after = datetime.datetime.fromisoformat(until_time)
             else:
@@ -352,9 +369,10 @@ class Job:
         """Set the function to execute and schedule the first run."""
         self.job_func = functools.partial(job_func, *args, **kwargs)
         functools.update_wrapper(self.job_func, job_func)
+        self._is_async = inspect.iscoroutinefunction(job_func)
         self._schedule_next_run()
         if self.scheduler is not None:
-            self.scheduler.jobs.append(self)
+            self.scheduler._add_job(self)
         return self
 
     def tag(self, *tags: Hashable) -> Job:
@@ -367,17 +385,31 @@ class Job:
         if self.job_func is None:
             raise ScheduleValueError("No job function set. Call .do() first.")
 
-        result = self.job_func()
+        try:
+            if self._is_async:
+                result = _run_async(self.job_func)
+            else:
+                result = self.job_func()
+        except Exception as exc:
+            handler = self.on_error
+            if handler is None and self.scheduler is not None:
+                handler = self.scheduler.on_error
+            if handler is not None:
+                handler(self, exc)
+            else:
+                _logger.exception("Job %r raised an exception", self)
+            self.last_run = self._now()
+            self._schedule_next_run()
+            return None
+
         self.last_run = self._now()
         self._schedule_next_run()
 
-        # Check CancelJob sentinel.
         if isinstance(result, CancelJob) or result is CancelJob:
             if self.scheduler is not None:
                 self.scheduler.cancel_job(self)
             return result
 
-        # Check deadline.
         if self.cancel_after is not None and self._now() >= self.cancel_after:
             if self.scheduler is not None:
                 self.scheduler.cancel_job(self)
@@ -401,7 +433,6 @@ class Job:
         if self.unit is None:
             raise ScheduleValueError("No time unit set")
 
-        # Determine the actual interval (with jitter if .to() was used).
         interval = self.interval
         if self.latest is not None:
             if self.latest < self.interval:
@@ -410,25 +441,43 @@ class Job:
                 )
             interval = random.randint(self.interval, self.latest)
 
-        self.period = _UNIT_TO_DELTA[self.unit](interval)
-
         now = self._now()
+
+        # Monthly scheduling uses calendar arithmetic.
+        if self.unit == "months":
+            self.period = datetime.timedelta(days=30)  # approximate
+            self.next_run = _add_months(now, interval)
+            if self.at_time is not None:
+                self.next_run = self.next_run.replace(
+                    hour=self.at_time.hour,
+                    minute=self.at_time.minute,
+                    second=self.at_time.second,
+                    microsecond=0,
+                )
+                if self.next_run <= now:
+                    self.next_run = _add_months(now, interval + 1)
+                    self.next_run = self.next_run.replace(
+                        hour=self.at_time.hour,
+                        minute=self.at_time.minute,
+                        second=self.at_time.second,
+                        microsecond=0,
+                    )
+            return
+
+        self.period = _UNIT_TO_DELTA[self.unit](interval)
         self.next_run = now + self.period
 
         if self.at_time is not None:
             if self.unit == "days" and self.start_day is None:
-                # Daily job at a specific time.
                 self.next_run = now.replace(
                     hour=self.at_time.hour,
                     minute=self.at_time.minute,
                     second=self.at_time.second,
                     microsecond=0,
                 )
-                # If we've already passed today's time, schedule for tomorrow.
                 if self.next_run <= now:
                     self.next_run += self.period
             elif self.unit == "weeks" and self.start_day is not None:
-                # Weekday job at a specific time.
                 weekday_num = _WEEKDAY_MAP[self.start_day]
                 days_ahead = weekday_num - now.weekday()
                 if days_ahead < 0:
@@ -442,7 +491,6 @@ class Job:
                 if self.next_run <= now:
                     self.next_run += datetime.timedelta(weeks=self.interval)
             elif self.unit == "weeks" and self.start_day is None:
-                # Weekly (no weekday) at a specific time.
                 self.next_run = now.replace(
                     hour=self.at_time.hour,
                     minute=self.at_time.minute,
@@ -467,7 +515,6 @@ class Job:
                 if self.next_run <= now:
                     self.next_run += self.period
         elif self.start_day is not None:
-            # Weekday job without at_time.
             weekday_num = _WEEKDAY_MAP[self.start_day]
             days_ahead = weekday_num - now.weekday()
             if days_ahead <= 0:
@@ -476,6 +523,31 @@ class Job:
                 now.replace(hour=0, minute=0, second=0, microsecond=0)
                 + datetime.timedelta(days=days_ahead)
             )
+
+
+def _add_months(dt: datetime.datetime, months: int) -> datetime.datetime:
+    """Add months to a datetime, clamping day to month-end if needed."""
+    month = dt.month - 1 + months
+    year = dt.year + month // 12
+    month = month % 12 + 1
+    max_day = calendar.monthrange(year, month)[1]
+    day = min(dt.day, max_day)
+    return dt.replace(year=year, month=month, day=day)
+
+
+def _run_async(func: functools.partial[Any]) -> Any:
+    """Run an async job function, creating an event loop if needed."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is not None and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, func())
+            return future.result()
+    return asyncio.run(func())
 
 
 _UNIT_TO_DELTA = {
@@ -511,7 +583,6 @@ def _resolve_tz(tz: Any) -> datetime.tzinfo:
         return ZoneInfo(tz)
     if isinstance(tz, datetime.tzinfo):
         return tz
-    # pytz objects are also tzinfo subclasses, so the above catches them.
     raise ScheduleValueError(f"Invalid timezone: {tz!r}")
 
 
@@ -526,12 +597,23 @@ class Scheduler:
         self,
         timezone: Optional[Any] = None,
         clock: Optional[Clock] = None,
+        on_error: Optional[Callable[[Job, Exception], None]] = None,
+        max_workers: Optional[int] = None,
     ) -> None:
         self.jobs: List[Job] = []
         self.timezone: Optional[datetime.tzinfo] = None
         self.clock: Optional[Clock] = clock
+        self.on_error: Optional[Callable[[Job, Exception], None]] = on_error
+        self._max_workers: Optional[int] = max_workers
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._lock = threading.RLock()
         if timezone is not None:
             self.timezone = _resolve_tz(timezone)
+
+    def _add_job(self, job: Job) -> None:
+        """Thread-safe job list append."""
+        with self._lock:
+            self.jobs.append(job)
 
     def every(self, interval: int = 1) -> Job:
         """Create a new :class:`Job` attached to this scheduler."""
@@ -540,39 +622,80 @@ class Scheduler:
 
     def run_pending(self) -> None:
         """Run all jobs that are scheduled to run now."""
-        # Sort by next_run so the earliest jobs run first.
-        runnable = sorted(
-            [j for j in self.jobs if j.should_run]
-        )
+        with self._lock:
+            runnable = sorted(
+                [j for j in self.jobs if j.should_run]
+            )
+        if self._max_workers is not None:
+            self._ensure_executor()
+            futures = []
+            for job in runnable:
+                futures.append(self._executor.submit(self._run_job, job))  # type: ignore[union-attr]
+            for f in futures:
+                f.result()  # wait for all
+        else:
+            for job in runnable:
+                self._run_job(job)
+
+    async def run_pending_async(self) -> None:
+        """Awaitable version of run_pending for async contexts."""
+        with self._lock:
+            runnable = sorted(
+                [j for j in self.jobs if j.should_run]
+            )
         for job in runnable:
-            self._run_job(job)
+            if job._is_async and job.job_func is not None:
+                try:
+                    result = await job.job_func()
+                except Exception as exc:
+                    handler = job.on_error or self.on_error
+                    if handler is not None:
+                        handler(job, exc)
+                    else:
+                        _logger.exception("Job %r raised an exception", job)
+                    job.last_run = job._now()
+                    job._schedule_next_run()
+                    continue
+                job.last_run = job._now()
+                job._schedule_next_run()
+                if isinstance(result, CancelJob) or result is CancelJob:
+                    self.cancel_job(job)
+                elif job.cancel_after is not None and job._now() >= job.cancel_after:
+                    self.cancel_job(job)
+            else:
+                self._run_job(job)
 
     def run_all(self, delay_seconds: int = 0) -> None:
         """Run all jobs immediately, optionally with a delay between each."""
-        for job in sorted(self.jobs):
+        with self._lock:
+            jobs = sorted(self.jobs[:])
+        for job in jobs:
             self._run_job(job)
             if delay_seconds > 0:
                 _time.sleep(delay_seconds)
 
     def get_jobs(self, tag: Optional[Hashable] = None) -> List[Job]:
         """Return jobs, optionally filtered by tag."""
-        if tag is None:
-            return self.jobs[:]
-        return [j for j in self.jobs if tag in j.tags]
+        with self._lock:
+            if tag is None:
+                return self.jobs[:]
+            return [j for j in self.jobs if tag in j.tags]
 
     def clear(self, tag: Optional[Hashable] = None) -> None:
         """Cancel all jobs, or only those with the given tag."""
-        if tag is None:
-            self.jobs[:] = []
-        else:
-            self.jobs[:] = [j for j in self.jobs if tag not in j.tags]
+        with self._lock:
+            if tag is None:
+                self.jobs[:] = []
+            else:
+                self.jobs[:] = [j for j in self.jobs if tag not in j.tags]
 
     def cancel_job(self, job: Job) -> None:
         """Remove a specific job from the scheduler."""
-        try:
-            self.jobs.remove(job)
-        except ValueError:
-            pass
+        with self._lock:
+            try:
+                self.jobs.remove(job)
+            except ValueError:
+                pass
 
     def get_next_run(self, tag: Optional[Hashable] = None) -> Optional[datetime.datetime]:
         """Return the next run time across all (or tagged) jobs."""
@@ -603,6 +726,16 @@ class Scheduler:
 
     def _run_job(self, job: Job) -> Any:
         return job.run()
+
+    def _ensure_executor(self) -> None:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
+
+    def shutdown(self) -> None:
+        """Shut down the thread pool executor if one was created."""
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
 
 
 # ---------------------------------------------------------------------------
