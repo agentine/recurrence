@@ -7,10 +7,28 @@ import functools
 import random
 import re
 import time as _time
-from typing import Any, Callable, Hashable, List, Optional, Set, Union
+from typing import Any, Callable, Hashable, List, Optional, Protocol, Set, Union
 
 from recurrence import CancelJob
 from recurrence.exceptions import IntervalError, ScheduleValueError
+
+
+# ---------------------------------------------------------------------------
+# Clock protocol
+# ---------------------------------------------------------------------------
+
+class Clock(Protocol):
+    """Pluggable clock for deterministic testing."""
+
+    def now(self, tz: Optional[datetime.tzinfo] = None) -> datetime.datetime:
+        ...  # pragma: no cover
+
+
+class _DefaultClock:
+    """Uses ``datetime.datetime.now()``."""
+
+    def now(self, tz: Optional[datetime.tzinfo] = None) -> datetime.datetime:
+        return datetime.datetime.now(tz)
 
 
 # ---------------------------------------------------------------------------
@@ -26,7 +44,7 @@ class Job:
         self.job_func: Optional[functools.partial[Any]] = None
         self.unit: Optional[str] = None
         self.at_time: Optional[datetime.time] = None
-        self.at_time_zone: Any = None  # timezone info
+        self.at_time_zone: Optional[datetime.tzinfo] = None
         self.last_run: Optional[datetime.datetime] = None
         self.next_run: Optional[datetime.datetime] = None
         self.period: Optional[datetime.timedelta] = None
@@ -54,6 +72,25 @@ class Job:
         return (self.next_run or datetime.datetime.max) < (
             other.next_run or datetime.datetime.max
         )
+
+    # -----------------------------------------------------------------------
+    # Clock / timezone helpers
+    # -----------------------------------------------------------------------
+
+    def _now(self) -> datetime.datetime:
+        """Return the current time, respecting scheduler timezone and clock."""
+        tz = self._effective_tz()
+        if self.scheduler is not None and self.scheduler.clock is not None:
+            return self.scheduler.clock.now(tz)
+        return datetime.datetime.now(tz)
+
+    def _effective_tz(self) -> Optional[datetime.tzinfo]:
+        """Return the timezone to use: job-level at_time_zone > scheduler tz."""
+        if self.at_time_zone is not None:
+            return self.at_time_zone
+        if self.scheduler is not None:
+            return self.scheduler.timezone
+        return None
 
     # -----------------------------------------------------------------------
     # Time-unit properties (singular: interval must be 1)
@@ -189,6 +226,7 @@ class Job:
         - day/weekday: ``"HH:MM"`` or ``"HH:MM:SS"``
         - hour: ``":MM"`` or ``"MM:SS"``
         - minute: ``":SS"``
+        - second: ``":SS"`` (ignored — seconds unit has no sub-second at())
         """
         # Validate that the unit is set.
         if self.unit not in ("hours", "days", "weeks", "minutes", "seconds"):
@@ -197,11 +235,7 @@ class Job:
             )
 
         if tz is not None:
-            try:
-                from zoneinfo import ZoneInfo
-            except ImportError:
-                from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
-            self.at_time_zone = ZoneInfo(tz)
+            self.at_time_zone = _resolve_tz(tz)
 
         # Parse time_str based on unit.
         if self.unit in ("days", "weeks"):
@@ -261,9 +295,11 @@ class Job:
                     f"Invalid second value in {time_str!r}"
                 )
             self.at_time = datetime.time(0, 0, second)
-        else:
+        elif self.unit == "seconds":
+            # For seconds unit, at() is a no-op (no sub-second precision).
+            # Accept :SS format for API completeness but effectively ignored.
             raise ScheduleValueError(
-                f"at() is not valid for {self.unit!r} unit"
+                "at() is not meaningful for the seconds unit"
             )
 
         return self
@@ -278,15 +314,16 @@ class Job:
         until_time: Union[datetime.datetime, datetime.timedelta, datetime.time, str],
     ) -> Job:
         """Set a deadline after which the job will no longer run."""
+        now = self._now()
         if isinstance(until_time, datetime.datetime):
             self.cancel_after = until_time
         elif isinstance(until_time, datetime.timedelta):
-            self.cancel_after = datetime.datetime.now() + until_time
+            self.cancel_after = now + until_time
         elif isinstance(until_time, datetime.time):
             self.cancel_after = datetime.datetime.combine(
-                datetime.date.today(), until_time
+                now.date(), until_time, tzinfo=now.tzinfo
             )
-            if self.cancel_after < datetime.datetime.now():
+            if self.cancel_after < now:
                 self.cancel_after += datetime.timedelta(days=1)
         elif isinstance(until_time, str):
             # Parse "HH:MM" or "HH:MM:SS" or "YYYY-MM-DD HH:MM:SS"
@@ -301,9 +338,9 @@ class Job:
                 else:
                     raise ScheduleValueError(f"Invalid until time: {until_time!r}")
                 self.cancel_after = datetime.datetime.combine(
-                    datetime.date.today(), t
+                    now.date(), t, tzinfo=now.tzinfo
                 )
-                if self.cancel_after < datetime.datetime.now():
+                if self.cancel_after < now:
                     self.cancel_after += datetime.timedelta(days=1)
         else:
             raise ScheduleValueError(
@@ -331,7 +368,7 @@ class Job:
             raise ScheduleValueError("No job function set. Call .do() first.")
 
         result = self.job_func()
-        self.last_run = datetime.datetime.now()
+        self.last_run = self._now()
         self._schedule_next_run()
 
         # Check CancelJob sentinel.
@@ -341,7 +378,7 @@ class Job:
             return result
 
         # Check deadline.
-        if self.cancel_after is not None and datetime.datetime.now() >= self.cancel_after:
+        if self.cancel_after is not None and self._now() >= self.cancel_after:
             if self.scheduler is not None:
                 self.scheduler.cancel_job(self)
             return result
@@ -353,7 +390,7 @@ class Job:
         """Return ``True`` if the job should be run now."""
         if self.next_run is None:
             return False
-        return datetime.datetime.now() >= self.next_run
+        return self._now() >= self.next_run
 
     # -----------------------------------------------------------------------
     # Scheduling internals
@@ -375,7 +412,7 @@ class Job:
 
         self.period = _UNIT_TO_DELTA[self.unit](interval)
 
-        now = datetime.datetime.now()
+        now = self._now()
         self.next_run = now + self.period
 
         if self.at_time is not None:
@@ -461,14 +498,40 @@ _WEEKDAY_MAP = {
 
 
 # ---------------------------------------------------------------------------
+# Timezone helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_tz(tz: Any) -> datetime.tzinfo:
+    """Convert a timezone string or pytz/zoneinfo object to a tzinfo."""
+    if isinstance(tz, str):
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
+        return ZoneInfo(tz)
+    if isinstance(tz, datetime.tzinfo):
+        return tz
+    # pytz objects are also tzinfo subclasses, so the above catches them.
+    raise ScheduleValueError(f"Invalid timezone: {tz!r}")
+
+
+# ---------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------
 
 class Scheduler:
     """Manages and runs a collection of scheduled :class:`Job` instances."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        timezone: Optional[Any] = None,
+        clock: Optional[Clock] = None,
+    ) -> None:
         self.jobs: List[Job] = []
+        self.timezone: Optional[datetime.tzinfo] = None
+        self.clock: Optional[Clock] = clock
+        if timezone is not None:
+            self.timezone = _resolve_tz(timezone)
 
     def every(self, interval: int = 1) -> Job:
         """Create a new :class:`Job` attached to this scheduler."""
@@ -529,7 +592,14 @@ class Scheduler:
         nr = self.next_run
         if nr is None:
             return None
-        return max(0.0, (nr - datetime.datetime.now()).total_seconds())
+        now = self._now()
+        return max(0.0, (nr - now).total_seconds())
+
+    def _now(self) -> datetime.datetime:
+        """Return current time respecting timezone and clock."""
+        if self.clock is not None:
+            return self.clock.now(self.timezone)
+        return datetime.datetime.now(self.timezone)
 
     def _run_job(self, job: Job) -> Any:
         return job.run()
