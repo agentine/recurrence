@@ -52,6 +52,8 @@ class Job:
         scheduler: Optional[Scheduler] = None,
         on_error: Optional[Callable[[Job, Exception], None]] = None,
     ) -> None:
+        if interval < 1:
+            raise IntervalError(f"Interval must be >= 1, got {interval}")
         self.interval: int = interval
         self.latest: Optional[int] = None
         self.job_func: Optional[functools.partial[Any]] = None
@@ -63,10 +65,12 @@ class Job:
         self.period: Optional[datetime.timedelta] = None
         self.start_day: Optional[str] = None
         self.cancel_after: Optional[datetime.datetime] = None
+        self.at_day: Optional[Union[int, str]] = None
         self.tags: Set[Hashable] = set()
         self.scheduler: Optional[Scheduler] = scheduler
-        self.on_error: Optional[Callable[[Job, Exception], None]] = on_error
+        self._on_error: Optional[Callable[[Job, Exception], None]] = on_error
         self._is_async: bool = False
+        self._running: bool = False
 
     def __repr__(self) -> str:
         if self.job_func:
@@ -262,6 +266,32 @@ class Job:
             self.at_time_zone = _resolve_tz(tz)
 
         if self.unit in ("days", "weeks", "months"):
+            # Monthly day-of-month syntax: "15 10:30" or "last 18:00"
+            if self.unit == "months":
+                dm = re.match(
+                    r"^(last|\d{1,2})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$",
+                    time_str,
+                )
+                if dm:
+                    day_part = dm.group(1)
+                    if day_part == "last":
+                        self.at_day = "last"
+                    else:
+                        day_num = int(day_part)
+                        if not 1 <= day_num <= 31:
+                            raise ScheduleValueError(
+                                f"Invalid day-of-month {day_num} in {time_str!r}"
+                            )
+                        self.at_day = day_num
+                    hour, minute = int(dm.group(2)), int(dm.group(3))
+                    second = int(dm.group(4)) if dm.group(4) else 0
+                    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+                        raise ScheduleValueError(
+                            f"Invalid time values in {time_str!r}"
+                        )
+                    self.at_time = datetime.time(hour, minute, second)
+                    return self
+
             m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", time_str)
             if not m:
                 raise ScheduleValueError(
@@ -345,7 +375,12 @@ class Job:
                 self.cancel_after += datetime.timedelta(days=1)
         elif isinstance(until_time, str):
             if " " in until_time and "-" in until_time:
-                self.cancel_after = datetime.datetime.fromisoformat(until_time)
+                try:
+                    self.cancel_after = datetime.datetime.fromisoformat(until_time)
+                except ValueError as exc:
+                    raise ScheduleValueError(
+                        f"Invalid ISO format until time: {until_time!r}"
+                    ) from exc
             else:
                 parts = until_time.split(":")
                 if len(parts) == 2:
@@ -375,6 +410,11 @@ class Job:
             self.scheduler._add_job(self)
         return self
 
+    def on_error(self, handler: Callable[[Job, Exception], None]) -> Job:
+        """Set an error handler for this job (fluent)."""
+        self._on_error = handler
+        return self
+
     def tag(self, *tags: Hashable) -> Job:
         """Tag this job for filtering."""
         self.tags.update(tags)
@@ -391,7 +431,7 @@ class Job:
             else:
                 result = self.job_func()
         except Exception as exc:
-            handler = self.on_error
+            handler = self._on_error
             if handler is None and self.scheduler is not None:
                 handler = self.scheduler.on_error
             if handler is not None:
@@ -446,7 +486,11 @@ class Job:
         # Monthly scheduling uses calendar arithmetic.
         if self.unit == "months":
             self.period = datetime.timedelta(days=30)  # approximate
-            self.next_run = _add_months(now, interval)
+            if self.at_day is not None:
+                # Day-of-month scheduling
+                self.next_run = _next_monthly_day(now, interval, self.at_day)
+            else:
+                self.next_run = _add_months(now, interval)
             if self.at_time is not None:
                 self.next_run = self.next_run.replace(
                     hour=self.at_time.hour,
@@ -455,7 +499,10 @@ class Job:
                     microsecond=0,
                 )
                 if self.next_run <= now:
-                    self.next_run = _add_months(now, interval + 1)
+                    if self.at_day is not None:
+                        self.next_run = _next_monthly_day(now, interval + 1, self.at_day)
+                    else:
+                        self.next_run = _add_months(now, interval + 1)
                     self.next_run = self.next_run.replace(
                         hour=self.at_time.hour,
                         minute=self.at_time.minute,
@@ -533,6 +580,20 @@ def _add_months(dt: datetime.datetime, months: int) -> datetime.datetime:
     max_day = calendar.monthrange(year, month)[1]
     day = min(dt.day, max_day)
     return dt.replace(year=year, month=month, day=day)
+
+
+def _next_monthly_day(
+    dt: datetime.datetime, months: int, at_day: Union[int, str]
+) -> datetime.datetime:
+    """Compute the next run date for a monthly job with a specific day-of-month."""
+    target = _add_months(dt, months)
+    year, month = target.year, target.month
+    max_day = calendar.monthrange(year, month)[1]
+    if at_day == "last":
+        day = max_day
+    else:
+        day = min(int(at_day), max_day)
+    return target.replace(day=day)
 
 
 def _run_async(func: functools.partial[Any]) -> Any:
@@ -621,21 +682,32 @@ class Scheduler:
         return job
 
     def run_pending(self) -> None:
-        """Run all jobs that are scheduled to run now."""
+        """Run all jobs that are scheduled to run now.
+
+        Thread-safe: concurrent calls will not double-execute jobs.
+        Each job is claimed under the lock before execution.
+        """
         with self._lock:
             runnable = sorted(
-                [j for j in self.jobs if j.should_run]
+                [j for j in self.jobs if j.should_run and not j._running]
             )
-        if self._max_workers is not None:
-            self._ensure_executor()
-            futures = []
             for job in runnable:
-                futures.append(self._executor.submit(self._run_job, job))  # type: ignore[union-attr]
-            for f in futures:
-                f.result()  # wait for all
-        else:
-            for job in runnable:
-                self._run_job(job)
+                job._running = True
+        try:
+            if self._max_workers is not None:
+                self._ensure_executor()
+                futures = []
+                for job in runnable:
+                    futures.append(self._executor.submit(self._run_job, job))  # type: ignore[union-attr]
+                for f in futures:
+                    f.result()  # wait for all
+            else:
+                for job in runnable:
+                    self._run_job(job)
+        finally:
+            with self._lock:
+                for job in runnable:
+                    job._running = False
 
     async def run_pending_async(self) -> None:
         """Awaitable version of run_pending for async contexts."""
@@ -648,7 +720,7 @@ class Scheduler:
                 try:
                     result = await job.job_func()
                 except Exception as exc:
-                    handler = job.on_error or self.on_error
+                    handler = job._on_error or self.on_error
                     if handler is not None:
                         handler(job, exc)
                     else:
@@ -728,8 +800,9 @@ class Scheduler:
         return job.run()
 
     def _ensure_executor(self) -> None:
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
+        with self._lock:
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
 
     def shutdown(self) -> None:
         """Shut down the thread pool executor if one was created."""

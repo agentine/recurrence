@@ -20,6 +20,7 @@ class CancelJob:
 
 # Import after CancelJob is defined (scheduler.py imports CancelJob).
 from recurrence.scheduler import (  # noqa: E402
+    Clock,
     Job,
     Scheduler,
     default_scheduler,
@@ -37,8 +38,14 @@ from recurrence.scheduler import (  # noqa: E402
 # Expose jobs list directly (schedule compatibility).
 jobs = default_scheduler.jobs
 
+async def run_pending_async() -> None:
+    """Run all pending jobs on the default scheduler (async)."""
+    await default_scheduler.run_pending_async()
+
+
 __all__ = [
     "CancelJob",
+    "Clock",
     "Job",
     "Scheduler",
     "ScheduleError",
@@ -47,6 +54,7 @@ __all__ = [
     "default_scheduler",
     "every",
     "run_pending",
+    "run_pending_async",
     "run_all",
     "get_jobs",
     "clear",
