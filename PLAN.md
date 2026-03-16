@@ -5,7 +5,7 @@
 **Target:** [schedule](https://github.com/dbader/schedule) — the most popular Python in-process job scheduler
 **Package:** `recurrence` on PyPI
 **License:** MIT
-**Python:** 3.9+
+**Python:** 3.10+
 **Dependencies:** Zero required (optional: zoneinfo backport for 3.8)
 
 ## Why Replace schedule
